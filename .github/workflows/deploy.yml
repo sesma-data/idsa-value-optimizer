@@ -1,0 +1,44 @@
+name: Deploy Shiny App to EC2
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: 
+
+jobs:
+  deploy:
+    environment: Actions
+    runs-on: ubuntu-latest
+
+    steps:
+    # 1. Checkout del repositorio
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    # 2. Configurar clave SSH en archivo temporal
+    - name: Set up SSH key
+      run: |
+        echo "${{ secrets.EC2_SSH_KEY }}" > key.pem
+        chmod 600 key.pem
+
+    # 3. Copiar el contenido del repositorio a /srv/shiny-server/ en EC2
+    - name: Sync project files to EC2
+      run: |
+        rsync -avz \
+          --exclude='.git' \
+          --exclude='.github' \
+          -e "ssh -o StrictHostKeyChecking=no -i key.pem" \
+          ./ ubuntu@${{ secrets.EC2_HOST }}:/srv/shiny-server/
+
+    # 4. Ejecutar script para instalar dependencias R en el servidor
+    - name: Install R packages
+      run: |
+        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@${{ secrets.EC2_HOST }} \
+        "Rscript /srv/shiny-server/install_dependencies.R"
+
+    # 5. Reiniciar Shiny Server
+    - name: Restart Shiny Server
+      run: |
+        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@${{ secrets.EC2_HOST }} \
+        "sudo systemctl restart shiny-server"
