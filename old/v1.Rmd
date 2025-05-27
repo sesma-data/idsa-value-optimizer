@@ -1,0 +1,805 @@
+---
+title: "IdsaSalesForecast"
+output: html_document
+date: "2025-05-09"
+---
+
+# Proyeccion de ventas de un comercio y de linea de productos
+
+**Epica: Como dueño de tienda, necesito analizar la rentabilidad economica de mis ventas, para asi poder tomar acciones comerciales correspondientes**
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Common
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(tidyverse)
+
+# Models
+library(RANN)
+library(caret)
+library(purrr)
+library(Metrics)
+
+# Time Series
+library(forecast)
+library(tseries)
+library(tsibble)
+library(fable)
+library(feasts)
+library(forecast)
+library(timetk)
+library(tibbletime)
+library(fabletools)
+
+# Naive Bayes
+library(e1071)
+library(klaR)
+library(randomForest)
+```
+
+```{r envs, echo=FALSE}
+
+CSV_PATH <- "sales.csv"
+TS_TEST_SIZE <- 21
+GROSS_MARGIN_PERCENTAGE <- 4.761905
+```
+
+```{r sales}
+sales <- read.csv(CSV_PATH)
+sales
+```
+
+### Analisis Exploratorio Inicial
+
+```{r summary}
+summary(sales)
+```
+
+### Reporte general
+
+**Historia #1: Como dueño de negocio, me interesa obtener un analisis general del conjunto de datos, para asi tener recomendaciones rapidas y una vista general del rendimiento de mi negocio**
+
+```{r format}
+sales <- sales |>
+  mutate(
+    Time = hm(Time),
+    Hour = hour(Time),
+    Period = case_when(
+      Hour >= 3  & Hour < 6  ~ "Madrugada",
+      Hour >= 6  & Hour < 10 ~ "Mañana",
+      Hour >= 10 & Hour < 12 ~ "Media mañana",
+      Hour >= 12 & Hour < 14 ~ "Media tarde",
+      Hour >= 14 & Hour < 18 ~ "Tarde",
+      Hour >= 18 & Hour < 22 ~ "Noche",
+      Hour >= 22 | Hour < 3  ~ "Trasnoche", 
+      TRUE ~ NA_character_
+    )
+  )
+sales
+```
+
+```{r stats}
+
+sales_by_hour <- sales |>
+  count(Hour, sort = TRUE)
+
+sales_products <- sales |>
+  group_by(Product.line) |>
+  summarise(Ventas = sum(Quantity))
+
+sales_payment <- sales |>
+  count(Payment, sort = TRUE)
+  
+sales_period <- sales |>
+  count(Period, sort = TRUE)
+
+sales_cities <- sales |>
+  group_by(City) |>
+  summarise(Facturacion = sum(Total)) |>
+  arrange(desc(Facturacion))
+```
+
+Periodo de mayor ventas
+
+```{r stats}
+sales_period |>
+  slice(1)
+```
+
+Periodo de menor ventas
+
+```{r stats}
+sales_period |>
+  slice(n())
+```
+
+Hora de mas ventas
+
+```{r stats}
+sales_by_hour |> slice(1)
+```
+
+Hora de menos ventas
+
+```{r stats}
+sales_by_hour |> slice(n())
+```
+
+Producto de mayor ventas
+
+```{r stats}
+sales_products |>
+  arrange(desc(Ventas)) |>
+  slice(1)
+```
+
+Producto de menor ventas
+
+```{r stats}
+sales_products |>
+  arrange(Ventas) |>
+  slice(1)
+```
+
+Metodo de pago mas usado
+
+```{r stats}
+sales_payment |>
+  slice(1)
+```
+
+Metodo de pago menos usado
+
+```{r stats}
+sales_payment |>
+  slice(n())
+```
+
+Facturacion promedio
+
+```{r stats}
+ mean(sales$Total)
+```
+
+Rango de Facturacion
+
+```{r stats}
+range(sales$Total)
+```
+
+Ciudad con mayor facturacion
+
+```{r stats}
+sales_cities |> slice(1)
+```
+
+Ciudad con menor facturacion
+
+```{r stats}
+sales_cities |> slice(n())
+```
+
+Calificacion promedio
+
+```{r stats}
+mean(sales$Rating)
+```
+
+Facturacion promedio por linea de producto
+
+```{r}
+sales |>
+  group_by(Product.line) |>
+  summarise(Average = mean(Total)) |>
+  arrange(desc(Average))
+```
+
+# Proyeccion general de rentabilidad
+
+**Historia #2: Como dueño de negocio, me interesa proyectar la facturacion futura, para asi proyectar el margen bruto de toda la actividad**
+
+```{r sales_fc}
+sales_fc <- sales |>
+  dplyr::select(Total, Date) |>
+  group_by(Date) |>
+  summarise(Total = sum(Total)) |>
+  mutate(Date = as.Date(Date, "%m/%d/%Y")) |>
+  arrange(Date) 
+
+sales_fc
+```
+
+### Analisis de serie de tiempo
+
+Se trata de una serie de tiempo con frecuencia diaria. Convertimos a serie de tiempo. Si bien la serie de tiempo se registra de forma diaria, no hay suficientes registros para captar todos los dias del año (hay 89 registros y el año tiene 365 dias). A causa de eso, la serie no llega a completar un periodo de muestreo. A causa de eso, se dice que la serie de tiempo presenta intervalo irregular. Para gestionar dichas series de tiempo se opto por usar tsibble en lugar de ts.
+
+```{r ts_sales}
+ts_sales <- sales_fc |>
+  as_tsibble(index = Date)
+ts_sales
+```
+
+```{r}
+ts_sales |>
+    mutate(media_movil = slider::slide_dbl(Total, mean, .before = 3, .after = 3)) |>
+  autoplot(Total) +
+  geom_line(aes(y = media_movil), colour = "red") +
+  labs(title = "Ventas diarias (Con Media Movil de 7 dias)", y = "Ventas", x = "Fecha")
+```
+
+```{r}
+acf(ts_sales, main = "Función de Autocorrelación (ACF)")
+```
+
+```{r}
+pacf(ts_sales, main = "Función de Autocorrelación Parcial (PACF)")
+```
+
+```{r}
+ts_sales$Total |> as.numeric() |> adf.test()
+```
+
+
+La serie de tiempo no presenta un panorama claro para la elaboracion de modelos ARIMA. Se diferencia.
+
+```{r}
+ts_sales_diff <- ts_sales |>
+  mutate(Total = tsibble::difference(Total)) |>
+  na.omit()
+ts_sales_diff
+```
+
+```{r}
+ts_sales_diff |>
+    mutate(media_movil = slider::slide_dbl(Total, mean, .before = 3, .after = 3)) |>
+  autoplot(Total) +
+  geom_line(aes(y = media_movil), colour = "red") +
+  labs(title = "Ventas diarias diferenciadas (Con Media Movil de 7 dias)", y = "Ventas", x = "Fecha")
+```
+
+```{r}
+acf(ts_sales_diff, main = "Función de Autocorrelación (ACF)")
+```
+
+```{r}
+pacf(ts_sales_diff, main = "Función de Autocorrelación Parcial (PACF)")
+```
+
+```{r}
+ts_sales_diff$Total |> as.numeric() |> adf.test()
+```
+
+### Particion en train/test
+
+Partimos el conjunto en train y test. Al tratarse de una serie de tiempo, se debe respetar la temporalidad. Por tal motivo, se toma para el conjunto de entrenamiento
+
+```{r ts_train_test}
+
+fecha_corte <- max(ts_sales$Date) - TS_TEST_SIZE
+
+ts_train_set <- ts_sales |> filter(Date <= fecha_corte)
+ts_test_set  <- ts_sales |> filter(Date > fecha_corte)
+ts_h <- length(ts_test_set)
+
+autoplot(ts_sales, Total) +
+  geom_vline(xintercept = as.numeric(fecha_corte), linetype = "dashed", color = "red") +
+  labs(title = "Corte Train/Test", x = "Fecha")
+```
+
+### Analisis de Modelos ARIMA y ETS. Se analizan tanto el modelo generado por AutoARIMA como por interpretacion personal de graficos ACF y PACF.
+
+```{r}
+modelos <- ts_train_set |>
+  model(
+    AutoRIMA = ARIMA(Total),
+    ARIMA_100 = ARIMA(Total ~ pdq(1, 0, 0)),
+    ARIMA_300 = ARIMA(Total ~ pdq(3, 0, 0)),
+    ARIMA_400 = ARIMA(Total ~ pdq(4, 0, 0)), 
+    ARIMA_110 = ARIMA(Total ~ pdq(1, 1, 0)),
+    ARIMA_310 = ARIMA(Total ~ pdq(3, 1, 0)),
+    ARIMA_410 = ARIMA(Total ~ pdq(4, 1, 0)), 
+    ETS = ETS(Total)
+  )
+
+report(modelos)
+```
+
+```{r}
+# Forecast para los días del test
+fc <- modelos |>
+  forecast(h = nrow(ts_test_set))
+
+# Visualización vs datos reales
+fc %>%
+  autoplot(ts_sales) +
+  autolayer(ts_test_set, Total, color = "black") +
+  labs(title = "Pronóstico vs Observaciones reales", y = "Ventas")
+```
+
+```{r}
+accuracy(fc, ts_test_set)
+
+```
+
+### Analisis de modelo de Redes Neuronales
+
+```{r}
+# Para nnetar, trabajamos con 'ts'
+ventas_train_ts <- ts(ts_train_set$Total, frequency = 1)
+ventas_test_ts  <- ts(ts_test_set$Total, frequency = 1, start = length(ventas_train_ts) + 1)
+
+modelo_nnet <- nnetar(ventas_train_ts)
+fc_nnet <- forecast(modelo_nnet, h = length(ventas_test_ts))
+
+# Evaluación
+accuracy(fc_nnet, ventas_test_ts)
+
+# Plot
+autoplot(fc_nnet) +
+  autolayer(ventas_test_ts, series = "Test") +
+  labs(title = "NNAR: Predicción vs Realidad", y = "Ventas")
+
+```
+
+### Analisis del modelo mixto
+
+```{r decomp}
+# 1. STL descomposición de la serie completa
+decomp <- ts_sales |>
+  model(STL(Total ~ trend(window = TS_TEST_SIZE))) |>
+  components()
+
+# Visualización de componentes
+autoplot(decomp)
+
+```
+
+```{r decomp}
+decomp
+```
+
+```{r trend}
+# Tomamos solo la tendencia
+trend_data <- decomp |>
+  dplyr::select(Date, trend) |>
+  filter(!is.na(trend)) |>
+  as_tsibble(index = Date)
+
+# Modelo de tendencia
+modelo_trend <- trend_data |>
+  model(ARIMA_trend = ARIMA(trend ~ pdq(1, 0, 0)))
+
+# Pronóstico de la tendencia
+fc_trend <- modelo_trend |> forecast(h = TS_TEST_SIZE) |> as_tibble()
+fc_trend
+
+```
+
+```{r seasonal}
+# Estacionalidad histórica
+seasonal_data <- decomp |>
+  dplyr::select(Date, season_week) |>
+  rename(seasonality = season_week) %>%
+  filter(!is.na(seasonality))
+
+# Fechas futuras desde fc_trend
+future_dates <- fc_trend %>%
+  as_tibble() %>%
+  dplyr::select(Date)
+
+# Patrón estacional de los últimos N días
+pattern <- tail(seasonal_data$seasonality, n = nrow(future_dates))
+
+# Asegurarse de que el patrón tiene longitud suficiente
+if (length(pattern) < nrow(future_dates)) {
+  pattern <- rep(pattern, length.out = nrow(future_dates))
+}
+
+# Construir fc_season alineado con las fechas de pronóstico
+fc_season <- future_dates %>%
+  mutate(seasonality = pattern)
+
+fc_season
+```
+
+```{r residual}
+# Tomamos residuos
+residual_data <- decomp %>%
+  dplyr::select(Date, remainder) %>%
+  filter(!is.na(remainder)) %>%
+  as_tsibble(index = Date)
+
+## Modelo AutoARIMA
+# modelo_resid <- residual_data %>% model(ARIMA_resid = ARIMA(remainder))
+# fc_resid <- forecast(modelo_resid, h = TS_TEST_SIZE) |> as_tibble()
+
+## Modelo de Redes Neuronales
+# modelo_resid <- nnetar(ts(residual_data$remainder, frequency = 1))
+# fc_resid <- forecast(modelo_resid, h = TS_TEST_SIZE) |> as_tibble()
+# fc_resid$Date <- fc_season$Date 
+# fc_resid$.mean <- fc_resid$`Point Forecast`
+
+## Modelo por ETS
+modelo_resid <- residual_data %>% model(ETS_Resid = ETS(remainder))
+fc_resid <- forecast(modelo_resid, h = TS_TEST_SIZE) |> as_tibble()
+fc_resid <- fc_resid |>
+  mutate(.mean = mean(remainder))
+fc_resid
+
+```
+
+```{r fc_final}
+# Juntamos todos los componentes pronosticados
+fc_final <- fc_trend |>
+  dplyr::select(Date, .mean) |>
+  rename(trend = .mean) |>
+  left_join(fc_season, by = "Date") |>
+  left_join(
+    fc_resid |> dplyr::select(Date, .mean) |> rename(remainder = .mean),
+    by = "Date"
+  ) |>
+  mutate(pronostico_mixto = trend + seasonality + remainder)
+
+fc_final$Date <- ts_test_set$Date
+
+# Visualización
+df_plot <- ts_sales %>%
+  filter(Date > (max(ts_sales$Date) - TS_TEST_SIZE))  # últimos 30 días reales
+
+autoplot(df_plot, Total) +
+  geom_line(data = fc_final, aes(x = Date, y = pronostico_mixto), color = "blue") +
+  labs(title = "Modelo Mixto: Trend + Estacionalidad + Residuos", y = "Ventas")
+
+```
+
+```{r metrics}
+# df_test tiene la observación real
+# fc_final tiene el pronóstico mixto
+
+# Renombramos por claridad
+observado_vs_pronostico <- ts_test_set %>%
+  rename(Date = Date, observado = Total) %>%
+  inner_join(
+    fc_final %>% dplyr::select(Date, pronostico_mixto), 
+    by = "Date"
+  )
+
+observado_vs_pronostico <- observado_vs_pronostico %>%
+  filter(!is.na(observado) & !is.na(pronostico_mixto))
+
+mae_val  <- mae(observado_vs_pronostico$observado, observado_vs_pronostico$pronostico_mixto)
+rmse_val <- rmse(observado_vs_pronostico$observado, observado_vs_pronostico$pronostico_mixto)
+mape_val <- mape(observado_vs_pronostico$observado, observado_vs_pronostico$pronostico_mixto) * 100  # en %
+
+# Mostrar resultados
+tibble(
+  MAE = mae_val,
+  RMSE = rmse_val,
+  MAPE = mape_val
+)
+
+```
+
+
+### Modelos con hiperparametros optimizados (Para Optimizar)
+
+La función `pmap_dfr` proviene del paquete **`purrr`**, que forma parte del ecosistema de **`tidyverse`**. **`pmap_dfr`** es una función que permite iterar sobre los elementos de una lista o `data.frame` y, para cada combinación de elementos, aplica una función que devuelve un `data.frame`. Los resultados de cada iteración se combinan en un solo `data.frame` (lo que hace el sufijo `dfr`).
+
+Modelo ARIMA
+
+```{r echo=FALSE}
+# Definir los rangos para p, d, q y P, D, Q}
+grid_arima <- expand.grid(
+  p = 0:3, 
+  d = 1:2, 
+  q = 0:3,
+  P = 0:1, 
+  D = 0:1, 
+  Q = 0:1
+)
+
+# Búsqueda en la grilla
+arima_results <- pmap_dfr(grid_arima, function(p, d, q, P, D, Q) {
+  
+  fit <- ts_train_set |>
+    model(
+      ARIMA = ARIMA(Total ~ pdq(p, d, q) + PDQ(P, D, Q) + trend() )
+    )
+
+  # Realizar la predicción
+  fc <- forecast(fit, h = nrow(ts_test_set))
+  
+  print(fc)
+  
+  # Calcular RMSE
+  fc_df <- as_tibble(fc) %>%
+    filter(.model == "ARIMA") %>%
+    mutate(Date = ts_test_set$Date, observado = ts_test_set$Total) %>%
+    filter(!is.na(.mean))
+  
+  rmse_val <- rmse(fc_df$observado, fc_df$.mean)
+  
+  tibble(p, d, q, P, D, Q, RMSE = rmse_val)
+})
+
+```
+```{r}
+
+coef_results <- arima_results |> arrange(RMSE) |> head(1)
+coef_results
+```
+
+```{r}
+opt_arima <-ts_train_set |>
+  model(
+    ARIMA_Opt = ARIMA(Total ~ pdq(coef_results$p, coef_results$d, coef_results$q)  + PDQ(coef_results$P, coef_results$D, coef_results$Q) )
+  )
+opt_arima |> report()
+```
+```{r}
+# Forecast para los días del test
+fc_opt_arima<- opt_arima |>
+  forecast(h = nrow(ts_test_set))
+
+# Visualización vs datos reales
+fc_opt_arima %>%
+  autoplot(ts_sales) +
+  autolayer(ts_test_set, Total, color = "black") +
+  labs(title = "Pronóstico vs Observaciones reales", y = "Ventas")
+```
+```{r}
+accuracy(fc_opt_arima, ts_test_set)
+```
+
+
+Optimizacion de ETS mediante Grid Search
+
+```{r}
+# Definir la grilla de posibles combinaciones de hiperparámetros
+model_grid <- expand.grid(
+  Tendencia = c("A", "N"),
+  Estacionalidad = c("A", "M", "N")
+)
+
+# Aplicar la búsqueda en grilla
+ets_results <- purrr::pmap_dfr(model_grid, function(Tendencia, Estacionalidad) {
+
+  # Ajustar el modelo ETS con los parámetros específicos
+  fit <- ts_train_set |>
+    as_tsibble(index = Date) |>
+    model(ETS = ETS(Total ~ trend(Tendencia |> as.character()) + season(Estacionalidad |> as.character())))
+  
+  # Predecir
+  fc <- forecast(fit, h = nrow(ts_test_set))
+  
+  # Calcular RMSE
+  fc_df <- as_tibble(fc) %>%
+    mutate(observado = ts_test_set$Total) %>%
+    filter(!is.na(.mean))
+  
+  rmse_val <- rmse(fc_df$observado, fc_df$.mean)
+  
+  # Devolver los resultados
+  tibble(Modelo = paste(Tendencia, Estacionalidad, sep = "_"),
+         RMSE = rmse_val)
+})
+
+# Ordenar por RMSE
+ets_results %>%
+  arrange(RMSE)
+
+```
+
+Optimizacion de Redes Neuronales con Grid Search
+
+```{r}
+# Definir los rangos para los hiperparámetros
+grid_nnetar <- expand.grid(
+  # p = 0:3, 
+  size = c(5, 10, 15)
+  # repeats = 10:15
+)
+
+# Búsqueda en la grilla
+nnetar_results <- pmap_dfr(grid_nnetar, function(size) {
+  fit <- ts_train_set |>
+    as_tsibble(index = Date) |>
+    model(NNETAR = NNETAR(box_cox(Total, size)))
+    #model( NNETAR = NNETAR(Total ~ lag(7), p = p, size = size, repeats = repeats))
+  
+  # Realizar la predicción
+  fc <- forecast(fit, h = nrow(ts_test_set))
+  
+  # Calcular RMSE
+  fc_df <- as_tibble(fc) %>%
+    filter(.model == "NNETAR") %>%
+    mutate(observado = ts_test_set$Total) %>%
+    filter(!is.na(.mean))
+  
+  rmse_val <- rmse(fc_df$observado, fc_df$.mean)
+  
+  tibble(size, RMSE = rmse_val)
+})
+
+# Ordenar por RMSE
+nnetar_results %>%
+  arrange(RMSE)
+
+```
+
+
+En base a los analisis, se opta por suavizado exponencial ETS con tendencia A y estacionalidad M.
+
+```{r}
+returns_model <- ts_sales |>
+  model(ETS = ETS(Total ~ trend("A") + season("M")))
+
+report(returns_model)
+```
+```{r}
+# Forecast para los proximos 30 dias
+returns_fc <- returns_model |>
+  forecast(h = 30)
+
+# Visualización vs datos reales
+returns_fc |>
+  autoplot(ts_sales) +
+  autolayer(returns_fc, Total, color = "blue") +
+  labs(title = "Pronostico de ventas", y = "Ventas")
+```
+```{r}
+returns_fc <- returns_fc |> 
+  as_tibble() |>
+  mutate(GrossIncome = GROSS_MARGIN_PERCENTAGE * .mean / 100) |>
+  dplyr::select(Date, GrossIncome)
+
+plot(returns_fc, type = "l")
+```
+Ratio de Sharpe para concluir el analisis de rentabilidad del negocio. El siguiente numero indica la rentabilidad esperada (%) del negocio
+
+```{r}
+log_rets <- diff(log(returns_fc$GrossIncome))
+mean(log_rets) / sd(log_rets) * 100
+```
+
+
+
+# Proyeccion de cantidad deseada dada la informacion de un producto
+
+**Historia #3: Como dueño de negocio, me interesa predecir la cantidad que sera comprada (Quantity) dados el tipo de ciudad (City), la rama de productos (Branch), el tipo de cliente (Customer.type), el genero (Gender), la linea de productos (Product.line), el tipo de pago (Payment) y el momento del dia de la compra (Period): para asi poder planificar el inventario futuro**
+
+### Setup del data set
+
+```{r sales_nv}
+
+sales_products <- sales |>
+  mutate(Quantity = as.factor(Quantity)) |>
+  dplyr::select(-any_of(c("Invoice.ID", "Date", "Time", "gross.margin.percentage",
+                   "gross.income", "cogs", "Total", "Tax.5.", "Rating"))) |>
+  mutate(across(where(is.character), as.factor))
+
+sales_products
+```
+
+### Particion en train/test
+
+```{r}
+set.seed(123)
+trainIndex <- createDataPartition(sales_products$Quantity, p = 0.8, list = FALSE)
+train_s <- sales_products[trainIndex, ]
+test_s <- sales_products[-trainIndex, ]
+
+train_products <- na.roughfix(train_s)
+test_products <- na.roughfix(test_s)
+
+ctrl <- trainControl(method = "cv", number = 5)
+```
+
+### Analisis de Naive Byes
+
+```{r}
+nb_model <- train(
+  Quantity ~ ., data = train_products,
+  method = "naive_bayes",
+  trControl = ctrl,
+  tuneLength = 10
+)
+nb_model
+```
+
+```{r}
+nb_pred <- predict(nb_model, test_products)
+confusionMatrix(nb_pred, test_products$Quantity)
+```
+
+### Analisis de RandomForest
+
+```{r}
+rf_model <- train(
+  Quantity ~ ., data = train_products,
+  method = "rf",
+  trControl = ctrl,
+  tuneLength = 5
+)
+rf_model
+
+```
+
+```{r}
+rf_pred <- predict(rf_model, test_products)
+confusionMatrix(rf_pred, test_products$Quantity)
+```
+
+### Analisis de SVM
+
+```{r}
+
+svm_model <- train(
+  Quantity ~ ., data = train_products,
+  method = "svmRadial",
+  preProcess = c("center", "scale"),
+  trControl = ctrl,
+  tuneLength = 5
+)
+svm_model
+
+```
+
+```{r}
+svm_pred <- predict(svm_model, test_products)
+confusionMatrix(svm_pred, test_products$Quantity)
+
+```
+
+### Comparacion de modelos
+
+```{r}
+results <- resamples(list(
+  NaiveBayes = nb_model,
+  RandomForest = rf_model,
+  SVM = svm_model
+))
+
+summary(results)
+bwplot(results)
+```
+
+### Seleccion del mejor modelo
+
+```{r}
+sales_products <- na.roughfix(sales_products)
+final_model <- train(
+  Quantity ~ ., data = train_products,
+  method = "naive_bayes",
+  trControl = ctrl,
+  tuneLength = 5
+)
+final_model
+```
+
+### Entrenamiento real
+
+```{r}
+final_test <- data.frame(
+  "Branch" = "B", 
+  "City" = "Yangon", 
+  "Customer.type" = "Normal", 
+  "Gender" = "Male", 
+  "Product.line" = "Food and beverages", 
+  "Unit.price" = 75, 
+  "Payment" = "Cash",
+  "Hour" = 13,
+  "Period" = "Media tarde"
+)
+final_test
+```
+
+### Prediccion final de cantidad deseada
+
+```{r}
+predictedQuantity <- predict(final_model, final_test)
+predictedQuantity |> as.character()
+```

@@ -1,0 +1,132 @@
+---
+title: "viejo"
+output: html_document
+date: "2025-05-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Viejo
+
+VIEJO
+
+```{r}
+stl(ts_sales, s.window = "periodic") |> autoplot()
+```
+
+```{r}
+acf(ts_sales, main = "Función de Autocorrelación (ACF)")
+```
+
+```{r}
+pacf(ts_sales, main = "Función de Autocorrelación Parcial (PACF)")
+```
+
+```{r}
+adf.test(ts_sales)
+```
+
+### Evaluacion de Modelos
+
+Modelo ARIMA con optimizacion de hiperparametros por interpretacion de los graficos ACF y PACF
+
+```{r}
+p <- 15
+d <- 1
+q <- 0
+arima_model <- Arima(ts_train_set, c(p, d, q))
+arima_model
+```
+
+```{r}
+arima_model_fc <- forecast(arima_model, ts_h)
+arima_model_fc
+```
+
+```{r}
+autoplot(arima_model_fc)
+```
+
+```{r}
+build_forecast_metrics(arima_model_fc, ts_test_set)
+```
+
+Modelo ARIMA mediante Auto ARIMA
+
+```{r}
+auto_arima_model <- auto.arima(ts_train_set)
+auto_arima_model
+```
+
+```{r}
+auto_arima_model_fc <- forecast(auto_arima_model, ts_h)
+auto_arima_model_fc
+```
+
+```{r}
+autoplot(auto_arima_model_fc)
+```
+
+```{r}
+build_forecast_metrics(auto_arima_model_fc, ts_test_set)
+```
+
+Modelo de Medias Moviles con optimizacion de hiperparametros
+
+```{r}
+
+best_order <- (function() {
+  orders <- 1:10
+  rmse_vals <- numeric(length(orders))
+  
+  for (i in 1:length(orders)) {
+    model <- ma(ts_train_set, i)
+    fc <- forecast(model, ts_h)
+    rmse_vals[i] <- sqrt(mean((fc$mean - ts_test_set)**2))
+  }
+  
+  results <- data.frame(Order = orders, RMSE = rmse_vals) |>
+    arrange(RMSE)
+  
+  head(results, 1)$Order
+})()
+
+ma_model <- ma(ts_train_set, best_order)
+ma_model
+```
+
+```{r}
+ma_model_fc <- forecast(ma_model, ts_h)
+ma_model_fc
+```
+
+```{r}
+autoplot(ma_model_fc)
+```
+
+```{r}
+build_forecast_metrics(ma_model_fc, ts_test_set)
+```
+
+Modelo Mixto, utilizando diferentes modelos de serie de tiempo para cada uno de sus componentes
+
+```{r}
+ts_parts <- decompose(ts_sales)
+autoplot(ts_parts)
+```
+
+```{r}
+ts_parts$seasonal |> nnetar() |> forecast() |> autoplot()
+```
+
+```{r}
+ts_parts$random |> na.roughfix() |> nnetar() |> forecast() |> autoplot()
+```
+
+```{r}
+ts_parts$trend |> na.roughfix() |> auto.arima() |> forecast() |> autoplot()
+```
+
+## 

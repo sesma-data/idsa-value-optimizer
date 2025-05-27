@@ -1,0 +1,172 @@
+---
+title: "market"
+output: html_document
+date: "2025-05-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Analisis Financiero
+
+```{r}
+# Obtener series de tiempo
+library(quantmod)
+
+# Analisis descriptivo
+library(GA)
+
+# Mostrar portfolios
+library(dplyr)
+library(plotly)
+library(tidyr)
+```
+
+## Precios
+
+```{r adrs}
+adrs <- c("BBAR", "BMA", "CEPU", "CRESY", "EDN", "GGAL", "IRS", "LOMA", "PAM", "SUPV", "TEO", "TGS", "TS", "TX", "YPF")
+```
+
+```{r prices}
+prices <- (function(){
+  
+  fecha_fin <- Sys.Date()
+  fecha_inicio <- fecha_fin - 3*365 
+  
+  get_adr_data <- function(ticker) {
+    tryCatch({
+      data <- getSymbols(ticker, src = "yahoo", from = fecha_inicio, to = fecha_fin, auto.assign = FALSE)
+      data <- Cl(data)
+      colnames(data) <- ticker
+      return(data)
+    }, error = function(e) {
+      message(paste("Error al obtener datos para", ticker))
+      return(NULL)
+    })
+  }
+  
+  adr_data_list <- lapply(adrs, get_adr_data)
+  
+  adr_data_list <- adr_data_list[!sapply(adr_data_list, is.null)]
+  
+  adr_data <- do.call(merge, adr_data_list)
+  
+  adr_data_filled <- na.locf(adr_data, na.rm = FALSE)
+  
+  adr_data_filled
+})()
+```
+
+## Retornos
+
+```{r retts}
+retts <- prices |> log() |> diff() |> na.omit()
+```
+
+## Matriz de Varianzas/Covarianzas
+
+```{r cov_matrix}
+cov_matrix <- cov(retts)
+```
+
+## Retorno esperado
+
+```{r}
+expected_returns <- colMeans(retts)
+n <- length(expected_returns)
+```
+
+## Funciones a optimizar
+
+```{r fitness}
+fitness_sharpe <- function(wg) {
+  wg <- wg / sum(wg)
+  p_ret <- sum(wg * expected_returns)
+  p_sd <- sqrt(t(wg) %*% cov_matrix %*% wg)
+  -(p_ret / p_sd)
+}
+
+fitness_return <- function(wg) {
+  wg <- wg / sum(wg)
+  -(sum(wg * expected_returns))
+}
+
+fitness_risk <- function(wg) {
+  wg <- wg / sum(wg)
+  sqrt(t(wg) %*% cov_matrix %*% wg)
+}
+```
+
+```{r}
+trainGa <- function(x) {
+  ga_results <- ga(
+    type = "real-valued",
+    fitness = x,
+    lower = rep(0, n),
+    upper = rep(1, n),
+    popSize = 100,
+    maxiter = 500,
+    run = 50,
+    seed = 123
+  )
+  
+  plot(ga_results)
+  
+  ga_weights <- ga_results@solution
+  ga_weights <- ga_weights / sum(ga_weights)
+  
+  y <- as.data.frame(ga_weights)
+  colnames(y) <- adrs
+  
+  ga_weights <- ga_weights |> as.numeric()
+  
+  y$Return <- c(sum(ga_weights * expected_returns))
+  y$Risk <- c(sqrt(t(ga_weights) %*% cov_matrix %*% ga_weights))
+  
+  y
+}
+
+plotGa <- function(x){
+  x <- x |> select(-Return, -Risk)
+  
+  df_long <- pivot_longer(x, cols = everything(), names_to = "Activo", values_to = "Peso")
+  df_long <- df_long %>%
+  mutate(
+    porcentaje = round(Peso * 100, 1),
+    etiqueta = paste0(Activo, "\n", porcentaje, "%")
+  )
+  
+  p <- plot_ly(df_long, labels = ~Activo, values = ~Peso, type = 'pie',
+        textinfo = 'label+percent',
+        insidetextorientation = 'radial') %>%
+  layout(title = 'Distribución de Pesos del Portafolio')
+  
+  p
+}
+```
+
+```{r ga_sharpe}
+pf_sharpe <- trainGa(fitness_sharpe)
+```
+
+```{r}
+plotGa(pf_sharpe)
+```
+
+```{r ga_return}
+pf_return <- trainGa(fitness_return)
+```
+
+```{r}
+plotGa(pf_return)
+```
+
+```{r ga_risk}
+pf_risk <- trainGa(fitness_risk)
+```
+
+```{r}
+plotGa(pf_risk)
+```

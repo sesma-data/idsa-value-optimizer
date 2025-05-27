@@ -1,0 +1,1118 @@
+---
+title: "ValuacionNegocio"
+output: html_document
+---
+
+# Valuacion del Negocio
+
+```{r library}
+# Analisis descriptivo
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(tidyverse)
+
+# Analisis diagnostico de series de tiempo
+library(tidyquant)
+library(tsibble)
+library(forecast)
+library(prophet)
+library(tseries)
+library(fable)
+library(purrr)
+library(feasts)
+
+# Prescripcion
+library(scales)
+
+# Recomendacion sobre portfolio de productos
+library(GA)
+library(plotly)
+```
+
+```{r sales}
+sales <- read.csv("sales.csv") |>
+  mutate(
+    Time = lubridate::hm(Time), # La hora no tiene segundos, solo hora y minutos
+    Hour = hour(Time), # Columna auxiliar para calcular el periodo
+    Date = lubridate::mdy(Date), # La fecha esta en formato mm-dd-yyy
+    Period = case_when(
+      Hour >= 3  & Hour < 6  ~ "Madrugada",
+      Hour >= 6  & Hour < 10 ~ "Mañana",
+      Hour >= 10 & Hour < 12 ~ "Media mañana",
+      Hour >= 12 & Hour < 14 ~ "Media tarde",
+      Hour >= 14 & Hour < 18 ~ "Tarde",
+      Hour >= 18 & Hour < 22 ~ "Noche",
+      Hour >= 22 | Hour < 3  ~ "Trasnoche", 
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+## Descripcion
+
+### Descripcion del conjunto de datos y de la situacion actual del negocio
+
+```{r setup.description}
+description <- (function(){
+  sales_by_hour <- sales |>
+  count(Hour, sort = TRUE)
+
+  sales_products <- sales |>
+    group_by(Product.line) |>
+    summarise(Ventas = sum(Quantity))
+  
+  sales_payment <- sales |>
+    count(Payment, sort = TRUE)
+    
+  sales_period <- sales |>
+    count(Period, sort = TRUE)
+  
+  sales_cities <- sales |>
+    group_by(City) |>
+    summarise(Facturacion = sum(Total)) |>
+    arrange(desc(Facturacion))
+  
+  avg_fact_by_product <- sales |>
+    group_by(Product.line) |>
+    summarise(Average = mean(Total)) |>
+    arrange(desc(Average))
+  
+  list(
+    "PeriodoMayorVentas" = sales_period |> slice(1),
+    "PeriodoMenorVentas" = sales_period |> slice(n()),
+    "HoraMasVentas" = sales_by_hour |> slice(1),
+    "HoraMenosVentas" = sales_by_hour |> slice(n()),
+    "ProductoMayorVentas" = sales_products |> arrange(desc(Ventas)) |> slice(1),
+    "ProductoMenorVentas" = sales_products |> arrange(Ventas) |> slice(1),
+    "MetodoPagoMasUsado" = sales_payment |> slice(1),
+    "MetodoPagoMenosUsado" = sales_payment |> slice(n()),
+    "FacturacionPromedio" = mean(sales$Total),
+    "RangoFacturacion" = range(sales$Total),
+    "CiudadMayorFacturacion" = sales_cities |> slice(1),
+    "CiudadMenorFacturacion" = sales_cities |> slice(n()),
+    "CalificacionPromedio" = mean(sales$Rating),
+    "FacturacionPromedioPorLineaProducto" = avg_fact_by_product
+  )
+})()
+```
+
+### Periodo de mayor ventas
+
+```{r}
+description$PeriodoMayorVentas
+```
+
+### Periodo de menor ventas
+
+```{r}
+description$PeriodoMenorVentas
+```
+
+### Hora de mas ventas
+
+```{r}
+description$HoraMasVentas
+```
+
+### Hora de menos ventas
+
+```{r}
+description$HoraMenosVentas
+```
+
+### Producto de mayor ventas
+
+```{r}
+description$ProductoMayorVentas
+```
+
+### Producto de menor ventas
+
+```{r}
+description$ProductoMenorVentas
+```
+
+### Metodo de pago mas usado
+
+```{r}
+description$MetodoPagoMasUsado
+```
+
+### Metodo de pago menos usado
+
+```{r}
+description$MetodoPagoMenosUsado
+```
+
+### Facturacion promedio
+
+```{r}
+description$FacturacionPromedio
+```
+
+### Rango de Facturacion
+
+```{r}
+description$RangoFacturacion
+```
+
+### Ciudad con mayor facturacion
+
+```{r}
+description$CiudadMayorFacturacion
+```
+
+### Ciudad con menor facturacion
+
+```{r}
+description$CiudadMenorFacturacion
+```
+
+### Calificacion promedio
+
+```{r}
+description$CalificacionPromedio
+```
+
+### Facturacion promedio por linea de producto
+
+```{r}
+description$FacturacionPromedioPorLineaProducto
+```
+
+## Diagnostico
+
+### Setup de la serie de tiempo de volumen
+
+```{r setup.diag}
+buildForecastMetrics <- function(fc) {
+  ts_test |>
+    inner_join(fc, by = join_by(ds)) |>
+    rename(test = y.x, forecast = y.y)
+}
+
+buildForecastPlot <- function(mtrcs) {
+    mtrcs |>
+      ggplot(aes(x = ds, y = test)) +
+      geom_line() +
+      geom_line(aes(y = forecast, color = "red")) +
+      labs(title = "Test vs Forecast")
+}
+
+buildForecastError <- function(mtrcs) {
+  err <- mtrcs |>
+    mutate(rmsd =  sqrt((test - forecast)^2 / ts_h))
+
+  err$rmsd |> mean() |> round(2)
+}
+
+ts_diag <- sales |>
+  dplyr::select(Total, Date) |>
+  group_by(Date) |>
+  summarise(Total = sum(Total)) |>
+  arrange(Date) |>
+  as_tsibble(index = Date) |>
+  rename(ds = Date, y = Total) # Formato comun entre diferentes modelos (incluyendo prophet)
+```
+
+### Graficos
+
+```{r hist.plots.diag}
+
+ts_diag |> ggplot(aes(x = ds, y = y)) + 
+  geom_line() +
+  geom_ma(ma_fun = EMA, n = 7, color = "red", linetype="solid") + 
+  labs(x = "Fecha", y = "Ventas", title = "Ventas historicas", subtitle = "(Con EMA de 7)")
+```
+
+```{r acf.plots.diag}
+acf(ts_diag, main = "Función de Autocorrelación (ACF)")
+```
+
+```{r pacf.plots.diag}
+pacf(ts_diag, main = "Función de Autocorrelación Parcial (PACF)")
+```
+
+```{r adf.diag}
+ts_diag$y |> as.numeric() |> adf.test()
+```
+
+### Particion en train/test
+
+```{r traintest.diag}
+
+test_size <- 20
+fecha_corte <- max(ts_diag$ds) - test_size
+
+ts_train <- ts_diag |> filter(ds <= fecha_corte)
+ts_test  <- ts_diag |> filter(ds > fecha_corte)
+ts_h <- length(ts_test)
+
+ts_diag |>
+  ggplot(aes(x = ds, y = y)) +
+  geom_line() +
+  geom_vline(xintercept = as.numeric(fecha_corte), linetype = "dashed", color = "red") +
+  labs(title = "Corte Train/Test")
+```
+
+### Analisis Modelo Prophet
+
+```{r forecast.prophet.diag}
+
+prophet_forecast <- (function(){
+  
+  mdl <- prophet(ts_test)
+  ft <- make_future_dataframe(mdl, periods = ts_h)
+  fc <- predict(mdl, ft)
+  
+  fc |>
+    mutate(ds = lubridate::ymd(ds)) |>
+    filter(ds > fecha_corte) |>
+    dplyr::select(ds, yhat) |>
+    rename(y = yhat)
+  
+})()
+prophet_forecast
+```
+
+```{r metrics.prophet.diag}
+prophet_metrics <- buildForecastMetrics(prophet_forecast)
+prophet_metrics |> buildForecastPlot()
+```
+
+Error Cuadratico Medio (En \$)
+
+```{r error.prophet.diag}
+prophet_error <- prophet_metrics |> buildForecastError()
+prophet_error
+```
+
+### Analisis modelo Auto ARIMA
+
+```{r forecast.autoarima.diag}
+autoarima_forecast <- (function(){
+  ts_train |> 
+    model(AutoARIMA = ARIMA(y)) |> 
+    forecast(h = test_size) |>
+    as_tibble() |>
+    mutate(ds = ymd(ds)) |>
+    dplyr::select(ds, .mean) |>
+    rename(y = .mean)
+})()
+
+autoarima_forecast
+```
+
+```{r metrics.autoarima.diag}
+autoarima_metrics <- buildForecastMetrics(autoarima_forecast)
+autoarima_metrics |> buildForecastPlot()
+```
+
+```{r error.autoarima.diag}
+autoarima_error <- autoarima_metrics |> buildForecastError()
+autoarima_error
+```
+
+### Analisis de Modelo Auto ETS
+
+```{r forecast.ets.diag}
+ets_forecast <- (function(){
+  ts_train |> 
+    model(AutoETS = ETS(y)) |> 
+    forecast(h = test_size) |>
+    as_tibble() |>
+    mutate(ds = ymd(ds)) |>
+    dplyr::select(ds, .mean) |>
+    rename(y = .mean)
+})()
+
+ets_forecast
+```
+
+```{r metrics.ets.diag}
+ets_metrics <- buildForecastMetrics(ets_forecast)
+ets_metrics |> buildForecastPlot()
+```
+
+```{r error.ets.diag}
+ets_error <- ets_metrics |> buildForecastError()
+ets_error
+```
+
+### Analisis de Modelo de Redes Neuronales
+
+```{r forecast.nnetar.diag}
+nnetar_forecast <- (function(){
+  
+  ventas_train_ts <- ts(ts_train$y, frequency = 1)
+  ventas_test_ts  <- ts(ts_test$y, frequency = 1, start = length(ventas_train_ts) + 1)
+  
+  modelo_nnet <- nnetar(ventas_train_ts)
+  fc_nnet <- forecast(modelo_nnet, h = length(ventas_test_ts))
+  
+  fc_nnet |>
+    as_tibble() |>
+    mutate(ds = ts_test$ds, y = `Point Forecast`) |>
+    dplyr::select(ds, y)
+  
+})()
+
+nnetar_forecast
+```
+
+```{r metrics.nnetar.diag}
+nnetar_metrics <- buildForecastMetrics(nnetar_forecast)
+nnetar_metrics |> buildForecastPlot()
+```
+
+```{r error.nnetar.diag}
+nnetar_error <- nnetar_metrics |> buildForecastError()
+nnetar_error
+```
+
+### Analisis de modelos ARIMA elegidos segun interpretacion de graficos ACF/PACF
+
+```{r forecast.arima.diag}
+arima_forecast <- (function(){
+  ts_train |>
+    model(
+      ARIMA_100 = ARIMA(y ~ pdq(1, 0, 0)),
+      ARIMA_300 = ARIMA(y ~ pdq(3, 0, 0)),
+      ARIMA_400 = ARIMA(y ~ pdq(4, 0, 0)), 
+      ARIMA_110 = ARIMA(y ~ pdq(1, 1, 0)),
+      ARIMA_310 = ARIMA(y ~ pdq(3, 1, 0)),
+      ARIMA_410 = ARIMA(y ~ pdq(4, 1, 0))
+    ) |>
+    forecast(h = test_size) |>
+    accuracy(ts_test) |>
+    arrange(RMSE) |>
+    select(.model) |>
+    head(1) |>
+    print()
+  
+  
+  ts_train |> 
+    model(ARIMA = ARIMA(y ~ pdq(3, 0, 0))) |> 
+    forecast(h = test_size) |>
+    as_tibble() |>
+    mutate(ds = ymd(ds)) |>
+    dplyr::select(ds, .mean) |>
+    rename(y = .mean)
+  
+})()
+
+arima_forecast
+```
+
+```{r metrics.arima.diag}
+arima_metrics <- buildForecastMetrics(arima_forecast)
+arima_metrics |> buildForecastPlot()
+```
+
+```{r error.arima.diag}
+arima_error <- arima_metrics |> buildForecastError()
+arima_error
+```
+
+### Analisis de Modelo ARIMA (Con optimizacion de hiperparametros)
+
+```{r forecast.gridarima.diag}
+gridarima_forecast <- (function(){
+  
+  grid_arima <- expand.grid(
+    p = 0:3, 
+    d = 1:2, 
+    q = 0:3,
+    P = 0:1, 
+    D = 0:1, 
+    Q = 0:1
+  )
+  
+  arima_results <- pmap_dfr(grid_arima, function(p, d, q, P, D, Q) {
+    
+    fc <- ts_train |> 
+      model(ARIMA = ARIMA(y ~ pdq(p, d, q) + PDQ(P, D, Q) + trend())) |> 
+      forecast(h = test_size) |>
+      as_tibble() |>
+      mutate(ds = ymd(ds)) |>
+      dplyr::select(ds, .mean) |>
+      rename(y = .mean)
+        
+    rmse_val <- buildForecastMetrics(fc) |> buildForecastError()
+    
+    tibble(p, d, q, P, D, Q, RMSE = rmse_val)
+  })
+  
+  coef_results <- arima_results |> arrange(RMSE) |> head(1)
+  
+  ts_train |>
+    model(
+      ARIMA_Opt = ARIMA(y ~ pdq(coef_results$p, coef_results$d, coef_results$q)  + PDQ(coef_results$P, coef_results$D, coef_results$Q) )
+    ) |>
+    forecast(h = test_size) |>
+    as_tibble() |>
+    mutate(ds = ymd(ds)) |>
+    dplyr::select(ds, .mean) |>
+    rename(y = .mean)
+})()
+
+gridarima_forecast
+```
+
+```{r metrics.gridarima.diag}
+gridarima_metrics <- buildForecastMetrics(gridarima_forecast)
+gridarima_metrics |> buildForecastPlot()
+```
+
+```{r error.gridarima.diag}
+gridarima_error <- gridarima_metrics |> buildForecastError()
+gridarima_error
+```
+
+### Analisis de modelo ETS (Con optimizacion de hiperparametros)
+
+```{r forecast.gridets.diag}
+gridets_forecast <- (function(){
+  
+  model_grid <- expand.grid(
+    Tendencia = c("A", "N"),
+    Estacionalidad = c("A", "M", "N")
+  )
+  
+  ets_results <- purrr::pmap_dfr(model_grid, function(Tendencia, Estacionalidad) {
+    
+    fc <- ts_train |> 
+      model(ETS = ETS(y ~ trend(Tendencia |> as.character()) + season(Estacionalidad |> as.character()))) |> 
+      forecast(h = test_size) |>
+      as_tibble() |>
+      mutate(ds = ymd(ds)) |>
+      dplyr::select(ds, .mean) |>
+      rename(y = .mean)
+  
+    rmse_val <- buildForecastMetrics(fc) |> buildForecastError()
+
+    tibble(Modelo = paste(Tendencia, Estacionalidad, sep = "_"),
+           RMSE = rmse_val)
+  })
+  
+  coef_results <- ets_results |> arrange(RMSE) |> head(1)
+  coef_results <- (function(){
+    m <- coef_results$Modelo |> str_split("_")
+    p <- m[[1]]
+    
+    list(
+      "trend" = p[1],
+      "season" = p[2]
+    )
+  })()
+  
+  ts_train |> 
+      model(ETS = ETS(y ~ trend(coef_results$trend) + season(coef_results$season))) |> 
+      forecast(h = test_size) |>
+      as_tibble() |>
+      mutate(ds = ymd(ds)) |>
+      dplyr::select(ds, .mean) |>
+      rename(y = .mean)
+})()
+
+gridets_forecast
+```
+
+```{r metrics.gridets.diag}
+gridets_metrics <- buildForecastMetrics(gridets_forecast)
+gridets_metrics |> buildForecastPlot()
+```
+
+```{r error.gridets.diag}
+gridets_error <- gridets_metrics |> buildForecastError()
+gridets_error
+```
+
+### Analisis de modelo Redes Neuronales (Con optimizacion de hiperparametros)
+
+```{r forecast.gridnnetar.diag}
+gridnnetar_forecast <- (function(){
+  
+  grid_nnetar <- expand.grid(
+    # p = 0:3, 
+    size = c(5, 10, 15)
+    # repeats = 10:15
+  )
+  
+  nnetar_results <- pmap_dfr(grid_nnetar, function(size) {
+    
+    fc <- ts_train |> 
+      model(NNETAR = NNETAR(box_cox(y, size))) |> 
+      forecast(h = test_size) |>
+      as_tibble() |>
+      mutate(ds = ymd(ds)) |>
+      dplyr::select(ds, .mean) |>
+      rename(y = .mean)
+    
+    rmse_val <- buildForecastMetrics(fc) |> buildForecastError()
+    
+    tibble(size, RMSE = rmse_val)
+  })
+  
+  coef_results <- nnetar_results |> arrange(RMSE) |> head(1)
+  
+  ts_train |> 
+      model(NNETAR = NNETAR(box_cox(y, coef_results$size))) |> 
+      forecast(h = test_size) |>
+      as_tibble() |>
+      mutate(ds = ymd(ds)) |>
+      dplyr::select(ds, .mean) |>
+      rename(y = .mean)
+})()
+
+gridnnetar_forecast
+```
+
+```{r metrics.gridnnetar.diag}
+gridnnetar_metrics <- buildForecastMetrics(gridnnetar_forecast)
+gridnnetar_metrics |> buildForecastPlot()
+```
+
+```{r error.gridnnetar.diag}
+gridnnetar_error <- gridnnetar_metrics |> buildForecastError()
+gridnnetar_error
+```
+
+### Analisis de modelo mixto
+
+Se eligen los mejores 2 modelos. Se utilizara el primer modelo -el de mayor rendimiento- para pronosticar la tendencia. Para la estacionalidad, se opta por repetir los patrones pasados. Para los residuos, se usa el segundo modelo elegido y se calcula la media de las proyecciones de dicho modelo.
+
+```{r setup.mix.diag}
+  tibble(
+    model = c("Prophet", "AutoARIMA", "ARIMA", "ETS", "NNETAR", "GridArima", "GridETS", "GridNNETAR"),
+    rmse = c(prophet_error, autoarima_error, arima_error, ets_error, nnetar_error, gridarima_error, gridets_error, gridnnetar_error)
+  ) |> 
+    arrange(rmse) |> 
+    head(2)
+```
+
+```{r forecast.mix.diag}
+mix_forecast <- (function() {
+  decomp <- ts_train |>
+    model(STL(y ~ trend(window = ts_h))) |>
+    components()
+  
+  rem <- decomp |> as_tibble() |> select(ds, remainder) |> rename(y = remainder) |> as_tsibble(index = ds)
+
+  # Forecast de la tendencia con GridETS
+  
+  fc_trend <- (function(train){
+
+      model_grid <- expand.grid(
+        Tendencia = c("A", "N"),
+        Estacionalidad = c("A", "M", "N")
+      )
+      
+      ets_results <- purrr::pmap_dfr(model_grid, function(Tendencia, Estacionalidad) {
+        
+        fc <- train |> 
+          model(ETS = ETS(y ~ trend(Tendencia |> as.character()) + season(Estacionalidad |> as.character()))) |> 
+          forecast(h = test_size) |>
+          as_tibble() |>
+          mutate(ds = ymd(ds)) |>
+          dplyr::select(ds, .mean) |>
+          rename(y = .mean)
+      
+        rmse_val <- buildForecastMetrics(fc) |> buildForecastError()
+    
+        tibble(Modelo = paste(Tendencia, Estacionalidad, sep = "_"),
+               RMSE = rmse_val)
+      })
+      
+      coef_results <- ets_results |> arrange(RMSE) |> head(1)
+      coef_results <- (function(){
+        m <- coef_results$Modelo |> str_split("_")
+        p <- m[[1]]
+        
+        list(
+          "trend" = p[1],
+          "season" = p[2]
+        )
+      })()
+      
+      train |> 
+          model(ETS = ETS(y ~ trend(coef_results$trend) + season(coef_results$season))) |> 
+          forecast(h = test_size) |>
+          as_tibble() |>
+          mutate(ds = ymd(ds)) |>
+          dplyr::select(ds, .mean) |>
+          rename(y = .mean)
+    })(decomp |> as_tibble() |> select(ds, trend) |> rename(y = trend) |> as_tsibble())
+  
+  print(fc_trend)
+
+  # Forecast de la estacionalidad siguiendo el patron
+  
+  fc_season <- (function(d){
+  
+    seasonal_data <- d |>
+      dplyr::select(ds, season_week) |>
+      rename(seasonality = season_week) %>%
+      filter(!is.na(seasonality))
+    
+    future_dates <- ts_test %>%
+      as_tibble() %>%
+      dplyr::select(ds)
+    
+    pattern <- tail(seasonal_data$seasonality, n = nrow(future_dates))
+    
+    if (length(pattern) < nrow(future_dates)) {
+      pattern <- rep(pattern, length.out = nrow(future_dates))
+    }
+    
+    fc_season <- future_dates %>%
+      mutate(seasonality = pattern)
+    
+    fc_season
+    
+  })(decomp)
+  
+  print(fc_season)
+  
+  # Forecast de los residuos con Prophet
+  
+  fc_remainder <- (function(t){
+      mdl <- prophet(t)
+      ft <- make_future_dataframe(mdl, periods = nrow(ts_test))
+      fc <- predict(mdl, ft)
+      
+      fc |>
+        mutate(ds = lubridate::ymd(ds)) |>
+        filter(ds > fecha_corte) |>
+        dplyr::select(ds, yhat) |>
+        rename(y = yhat)
+  })(rem)
+  
+  print(fc_remainder)
+  
+  fc_trend |>
+    inner_join(fc_season, by = join_by(ds)) |>
+    mutate(rem = mean(fc_remainder$y)) |>
+    rename(trend = y) |>
+    mutate(y = trend + seasonality + rem) |>
+    select(ds, y)
+
+})()
+
+mix_forecast
+```
+
+```{r mix.metrics.diag}
+mix_metrics <- buildForecastMetrics(mix_forecast)
+mix_metrics |> buildForecastPlot()
+```
+
+```{r error.mix.diag}
+mix_error <- mix_metrics |> buildForecastError()
+mix_error
+```
+
+### Resumen de modelos
+
+```{r resume.diag}
+  tibble(
+    model = c("Prophet", "AutoARIMA", "ARIMA", "ETS", "NNETAR", "GridArima", "GridETS", "GridNNETAR", "Mix"),
+    rmse = c(prophet_error, autoarima_error, arima_error, ets_error, nnetar_error, gridarima_error, gridets_error, gridnnetar_error, mix_error)
+  ) |> 
+    arrange(rmse)
+```
+
+## Prediccion
+
+### Prediccion del volumen con el modelo con menor RMSE.
+
+```{r fc.prediction}
+fc_prediction <- (function() {
+  decomp <- ts_diag |>
+    model(STL(y ~ trend(window = 90))) |>
+    components()
+  
+  rem <- decomp |> as_tibble() |> select(ds, remainder) |> rename(y = remainder) |> as_tsibble(index = ds)
+
+  # Forecast de la tendencia con GridETS
+  
+  fc_trend <- (function(train){
+
+      model_grid <- expand.grid(
+        Tendencia = c("A", "N"),
+        Estacionalidad = c("A", "M", "N")
+      )
+      
+      ets_results <- purrr::pmap_dfr(model_grid, function(Tendencia, Estacionalidad) {
+        
+        fc <- train |> 
+          model(ETS = ETS(y ~ trend(Tendencia |> as.character()) + season(Estacionalidad |> as.character()))) |> 
+          forecast(h = 90) |>
+          as_tibble() |>
+          mutate(ds = ymd(ds)) |>
+          dplyr::select(ds, .mean) |>
+          rename(y = .mean)
+      
+        rmse_val <- buildForecastMetrics(fc) |> buildForecastError()
+    
+        tibble(Modelo = paste(Tendencia, Estacionalidad, sep = "_"),
+               RMSE = rmse_val)
+      })
+      
+      coef_results <- ets_results |> arrange(RMSE) |> head(1)
+      coef_results <- (function(){
+        m <- coef_results$Modelo |> str_split("_")
+        p <- m[[1]]
+        
+        list(
+          "trend" = p[1],
+          "season" = p[2]
+        )
+      })()
+      
+      train |> 
+          model(ETS = ETS(y ~ trend(coef_results$trend) + season(coef_results$season))) |> 
+          forecast(h = 90) |>
+          as_tibble() |>
+          mutate(ds = ymd(ds)) |>
+          dplyr::select(ds, .mean) |>
+          rename(y = .mean)
+    })(decomp |> as_tibble() |> select(ds, trend) |> rename(y = trend) |> as_tsibble())
+  
+  print(fc_trend)
+
+  # Forecast de la estacionalidad siguiendo el patron
+  
+  fc_season <- (function(d){
+  
+    seasonal_data <- d |>
+      dplyr::select(ds, season_week) |>
+      rename(seasonality = season_week) %>%
+      filter(!is.na(seasonality))
+    
+    future_dates <- seq.Date(from = max(ts_diag$ds), by = "day", length.out = 90) |>
+      as_tibble() |>
+      rename(ds = value)
+    
+    pattern <- tail(seasonal_data$seasonality, n = nrow(future_dates))
+    
+    if (length(pattern) < nrow(future_dates)) {
+      pattern <- rep(pattern, length.out = nrow(future_dates))
+    }
+    
+    fc_season <- future_dates %>%
+      mutate(seasonality = pattern)
+    
+    fc_season
+    
+  })(decomp)
+  
+  print(fc_season)
+  
+  # Forecast de los residuos con Prophet
+  
+  fc_remainder <- (function(t){
+      mdl <- prophet(t)
+      ft <- make_future_dataframe(mdl, periods = 90)
+      fc <- predict(mdl, ft)
+      
+      fc |>
+        mutate(ds = lubridate::ymd(ds)) |>
+        filter(ds > fecha_corte) |>
+        dplyr::select(ds, yhat) |>
+        rename(y = yhat)
+  })(rem)
+  
+  print(fc_remainder)
+  
+  fc_trend |>
+    inner_join(fc_season, by = join_by(ds)) |>
+    mutate(rem = mean(fc_remainder$y)) |>
+    rename(trend = y) |>
+    mutate(y = trend + seasonality + rem) |>
+    select(ds, y)
+
+})()
+
+fc_prediction
+```
+
+```{r}
+ts_diag |>
+  ggplot(aes(x = ds, y = y)) +
+  geom_line() +
+  geom_line(aes(x = fc_prediction$ds, y = fc_prediction$y, color = "red")) +
+  labs(title = "Proyeccion a 3 meses")
+```
+
+## Prescripcion
+
+Valuar una compañia consiste, dicho de forma simple, en proyectar los flujos de caja y descontarlos a una tasa.
+
+Para poder proyectar los flujos de caja futuros, se deben proyectar los estados financieros de la compañia. Una forma muy comun de proyectar dicha informacion consiste, primero, en proyectar las ventas. Luego se calcular los ratios contables del momento presente en funcion de las ventas presentes. Finalmente, se mantienen los ratios constantes y se usan las ventas proyectadas para proyectar el resto de estados financieros.
+
+Esta forma de valuacion busca analizar como la estructura financiera actual de la compañia enfrentaria las ventas futuras.
+
+Una consideracion sobre la tasa de descuento: Para la valuacion por flujos de fondos descontados, se usa normalmente el promedio ponderado del costo de capital (WACC). Si bien dicha tasa se puede calcular en base a la informacion de los estados financieros -y, por tanto, puede automatizarse- no considero que sea lo mas realista. La tasa de descuento indica, en definitiva, el nivel de riesgo asumido. Quizas un inversor se conforme con descontar los flujos a la inflacion u otra tasa, por ejemplo. Tambien se debe considerar la estructura de capital (Equity/Deuda). Quizas un inversor quiera calcular la WACC segun la estructura de capital de la compañia en cuestion, mientras que otro quiera calcularla en base a una estructura de capital promedio del sector. O puede ser que se quiera descontar los flujos de esta compañia a la WACC de otra compañia, para ver si esta rinde mas que aquella. En fin. El calculo de esta tasa admite tantos casos particulares, que automatizarla seria reducir su eficacia. Queda a pericia de cada analista definir una tasa de descuento efectiva.
+
+### Configuracion del modelo de valuacion
+
+```{r setup.pres}
+# Asumimos los Ratios como inputs del modelo de valuacion
+ratios = list(
+  # Flujo de Caja Libre
+  "MargenOperativo" = 0.15,
+  "DepreciacionPorVenta" = 0.03,
+  "CapexPorVenta" = 0.05,
+  "CapTrabajoPorVenta" = 0.02,
+  "TasaImpositiva" = 0.30,
+  
+  # Tasa de Descuento
+  "TasaDescuento" = 0.04,
+  
+  # Valor Residual
+  "TasaCrecimiento" = 0.03 # Se asume crecimiento constante
+)
+```
+
+### Flujos de caja iniciales
+
+```{r cf.pres}
+cf <- fc_prediction
+cf
+```
+
+```{r plot.cf.pres}
+cf |>
+  ggplot(aes(x = ds, y = y)) +
+  geom_line() +
+  labs(title = "Proyeccion de Ventas", y = "$", x = "Periodo")
+```
+
+### Calculo de Flujo de Caja Libre
+
+```{r fcf.pres}
+fcf <- cf |>
+  mutate(
+    ebit = y * ratios$MargenOperativo,
+    depr = y * ratios$DepreciacionPorVenta,
+    capex = y * ratios$CapexPorVenta,
+    wc = y * ratios$CapTrabajoPorVenta
+  ) |>
+  mutate(
+    delta_wc = difference(wc)
+  ) |>
+  na.omit() |>
+  select(-wc) |>
+  mutate(fcf = ebit * (1 - ratios$TasaImpositiva) + depr - capex - delta_wc)
+
+fcf
+```
+
+### Valor Presente de los Flujos de Caja
+
+```{r npv.pres}
+npv <- sum(fcf$fcf / (1 + ratios$TasaDescuento)^(1:length(fcf$fcf)))
+npv |> dollar()
+```
+
+### Valor Residual
+
+```{r terminal_value.pres}
+terminal_value <- (tail(fcf, n = 1)$fcf * (1 + ratios$TasaCrecimiento)) / (ratios$TasaDescuento - ratios$TasaCrecimiento)
+terminal_value <- terminal_value / (1 + ratios$TasaDescuento)^length(fcf$fcf)
+terminal_value |> dollar()
+```
+
+### Valor final de la compañia
+
+```{r valor_empresa.pres}
+valor_empresa <- npv + terminal_value
+valor_empresa |> dollar()
+```
+
+### Escenario de Mercado
+
+Precio por accion
+
+```{r}
+cant_acciones_en_circulacion <- 2000
+precio_por_accion <- valor_empresa / cant_acciones_en_circulacion
+precio_por_accion |> dollar()
+```
+
+# Extra: Estrategia de Producto mediante Algoritmos Geneticos
+
+Como extra, se realiza una recomendacion, basada en Algoritmos Geneticos, acerca de la estrategia de producto que deberia adoptar la compañia.
+
+## Optimizacion basada en teoria moderna de cartera
+
+Se usa la teoria moderna de cartera (Markowitz) para elaborar una cartera de productos. Existen muchos paralelismos entre el comportamiento del precio de los activos financieros (como las acciones) y el comportamiento de los precios de los activos reales (como los productos). Ambos son activos, en definitiva. El precio refleja la demanda de dicho activo. A mayor precio, mayor demanda: y vicebersa. Tambien se puede considerar un conjunto de activos y analizar su correlacion y ver, por ejemplo, si la demanda de uno influye en la del otro.
+
+Teniendo estos paralelismos en cuenta, se diseño una primera recomendacion utilizando Algoritmos Geneticos para optimizar el "Portafolio" de productos. En lugar de tener un portafolios de activos financieros, tenemos un portafolio de activos reales. Sin embargo, los numeros reflejan lo mismo: la demanda de dicho bien. Es por esta razon que se puede utilizar este modelo de cartera aun en activos reales.
+
+Se toman los flujos de dinero diarios por activo y luego se prosigue al analisis de Markowitz clasico: se toma el retorno como la media de los rendimientos y el riesgo como la desviacion estandar de dichos rendimientos, se calculan los retornos logaritmicos, se calcula la matriz de varianzas/covarianzas, se calculan los retornos y los riesgos utilizando operaciones matriciales, etc.
+
+Luego, se presentan tres escenarios: El portafolio tangente que equilibra riesgo y retorno, el portafolio que minimiza la varianza y el portafolio que maximiza el retorno aun asumiendo mayor riesgo. Para encontrar estos tres portafolios se utilizan Algoritmos Geneticos
+
+### Precios
+
+```{r tks}
+tks <- c("ElectronicAccessories", "FashionAccessories", "FoodAndBeverages", "HealthAndBeauty", "HomeAndLifestyle", "SportsAndTravel")
+```
+
+```{r prices}
+prices <- (function(){
+  rellenar_ceros <- function(mat, factor = 0.1) {
+    mat_filled <- mat
+    for (j in seq_len(ncol(mat_filled))) {
+      col <- mat_filled[, j]
+      min_positive <- min(col[col > 0], na.rm = TRUE)
+      if (!is.finite(min_positive)) next
+      col[col == 0] <- min_positive * factor
+      mat_filled[, j] <- col
+    }
+    return(mat_filled)
+  }
+  
+  sales |>
+    group_by(Date, Product.line) |>
+    summarise(Total = sum(Total), .groups = "drop") |>
+    pivot_wider(
+        names_from = Product.line,
+        values_from = Total,
+        values_fill = list(Total = 0)
+      ) |>
+    rename (
+      ElectronicAccessories = `Electronic accessories`,
+      FashionAccessories = `Fashion accessories`,
+      FoodAndBeverages = `Food and beverages`,
+      HealthAndBeauty = `Health and beauty`,
+      HomeAndLifestyle = `Home and lifestyle`,
+      SportsAndTravel = `Sports and travel`
+    ) |>
+    select(-Date) |> 
+    as.matrix() |>
+    rellenar_ceros()
+})()
+```
+
+### Retornos
+
+```{r retts}
+retts <- prices |> log() |> diff() |> na.omit()
+```
+
+### Matriz de Varianzas/Covarianzas
+
+```{r cov_matrix}
+cov_matrix <- cov(retts)
+cov_matrix
+```
+
+### Retorno esperado
+
+```{r}
+expected_returns <- colMeans(retts)
+n <- length(expected_returns)
+```
+
+### Funciones a optimizar
+
+```{r fitness}
+fitness_sharpe <- function(wg) {
+  wg <- wg / sum(wg)
+  p_ret <- sum(wg * expected_returns)
+  p_sd <- sqrt(t(wg) %*% cov_matrix %*% wg)
+  -(p_ret / p_sd)
+}
+
+fitness_return <- function(wg) {
+  wg <- wg / sum(wg)
+  -(sum(wg * expected_returns))
+}
+
+fitness_risk <- function(wg) {
+  wg <- wg / sum(wg)
+  sqrt(t(wg) %*% cov_matrix %*% wg)
+}
+```
+
+```{r}
+trainGa <- function(x) {
+  ga_results <- ga(
+    type = "real-valued",
+    fitness = x,
+    lower = rep(0, n),
+    upper = rep(1, n),
+    popSize = 100,
+    maxiter = 500,
+    run = 50,
+    seed = 123
+  )
+  
+  plot(ga_results)
+  
+  ga_weights <- ga_results@solution
+  ga_weights <- ga_weights / sum(ga_weights)
+  
+  y <- as.data.frame(ga_weights)
+  colnames(y) <- tks
+  
+  ga_weights <- ga_weights |> as.numeric()
+  
+  y$Return <- c(sum(ga_weights * expected_returns))
+  y$Risk <- c(sqrt(t(ga_weights) %*% cov_matrix %*% ga_weights))
+  
+  y
+}
+
+plotGa <- function(x){
+  x <- x |> select(-Return, -Risk)
+  
+  df_long <- pivot_longer(x, cols = everything(), names_to = "Activo", values_to = "Peso")
+  df_long <- df_long %>%
+  mutate(
+    porcentaje = round(Peso * 100, 1),
+    etiqueta = paste0(Activo, "\n", porcentaje, "%")
+  )
+  
+  p <- plot_ly(df_long, labels = ~Activo, values = ~Peso, type = 'pie',
+        textinfo = 'label+percent',
+        insidetextorientation = 'radial') %>%
+  layout(title = 'Distribución de Pesos del Portafolio')
+  
+  p
+}
+```
+
+### Portafolio de productos con mejor relacion retorno/riesgo
+
+```{r ga_sharpe}
+pf_sharpe <- trainGa(fitness_sharpe)
+```
+
+```{r}
+plotGa(pf_sharpe)
+```
+
+### Portafolio de productos de mayor retorno
+
+```{r ga_return}
+pf_return <- trainGa(fitness_return)
+```
+
+```{r}
+plotGa(pf_return)
+```
+
+### Portafolio de productos de menor riesgo
+
+```{r ga_risk}
+pf_risk <- trainGa(fitness_risk)
+```
+
+```{r}
+plotGa(pf_risk)
+```
