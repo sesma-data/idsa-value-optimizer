@@ -31,13 +31,7 @@ jobs:
           -e "ssh -o StrictHostKeyChecking=no -i key.pem" \
           ./ ubuntu@${{ secrets.EC2_HOST }}:/srv/shiny-server/
 
-    # 4. Ejecutar script para instalar dependencias R en el servidor
-    - name: Install R packages
-      run: |
-        ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@${{ secrets.EC2_HOST }} \
-        "Rscript /srv/shiny-server/install_dependencies.R"
-
-    # 5. Reiniciar Shiny Server
+    # 4. Reiniciar Shiny Server
     - name: Restart Shiny Server
       run: |
         ssh -o StrictHostKeyChecking=no -i key.pem ubuntu@${{ secrets.EC2_HOST }} \
